@@ -44,6 +44,22 @@ https://b"
     assert_status 1
 }
 
+@test "check_base_url accepts site URLs" {
+    for u in https://owner.github.io/repo https://pkgs.example.com file:///tmp/site \
+        'https://h/a-b_c.d~e/%41+@=,'; do
+        run sh -c ". '$LIB/common.sh'; check_base_url base-url \"\$1\"" sh "$u"
+        assert_status 0
+    done
+}
+
+@test "check_base_url refuses what a shell would interpret" {
+    for u in 'https://h/p?q=1' 'https://h/a&b' 'https://h/a;b' 'https://h/(x)' \
+        'https://h/a*' 'https://h/a!b' 'https://h/a#b' http://x; do
+        run sh -c ". '$LIB/common.sh'; check_base_url base-url \"\$1\"" sh "$u"
+        assert_status 1
+    done
+}
+
 @test "check_relpath accepts relative paths and rejects absolute ones and .." {
     for p in site dist/x.rpm packaging/signing/repo.asc ./a 'a b/c' a..b; do
         run sh -c ". '$LIB/common.sh'; check_relpath p \"\$1\"" sh "$p"
@@ -85,6 +101,15 @@ https://b"
     [ "$output" = "::error::boom" ]
 }
 
+@test "warning prints an annotation in Actions and plain text elsewhere" {
+    run sh_lib "warning hi"
+    assert_status 0
+    [ "$output" = "warning: hi" ]
+    GITHUB_ACTIONS=true run sh_lib "warning hi"
+    assert_status 0
+    [ "$output" = "::warning::hi" ]
+}
+
 @test "set_output and set_env append to the runner's files" {
     run sh_lib "set_output a 1; set_output b two; set_env C 3"
     assert_status 0
@@ -112,6 +137,25 @@ b=two" ]
     run sh_lib "make_tmpdir d; echo \$d > '$TMP/path'; die x"
     assert_status 1
     [ ! -e "$(cat "$TMP/path")" ]
+}
+
+@test "register_container removes the containers on exit, die and TERM, and keeps make_tmpdir's cleanup" {
+    # The fake engine records each call; the real one isn't needed.
+    printf '#!/bin/sh\necho "$*" >> "%s/engine.log"\n' "$TMP" > "$TMP/engine"
+    chmod +x "$TMP/engine"
+    for end in 'true' 'die x' 'kill -TERM $$'; do
+        : > "$TMP/engine.log"
+        run sh_lib "make_tmpdir d; echo \$d > '$TMP/path'; register_container '$TMP/engine' c1
+            register_container '$TMP/engine' c2; $end"
+        [ "$(cat "$TMP/engine.log")" = "rm -f c1
+rm -f c2" ]
+        [ ! -e "$(cat "$TMP/path")" ]
+    done
+    assert_status 143
+    # Nothing registered: the engine is never called.
+    : > "$TMP/engine.log"
+    run sh_lib "true"
+    [ ! -s "$TMP/engine.log" ]
 }
 
 @test "pkg_matches_version: Debian versions and revisions" {

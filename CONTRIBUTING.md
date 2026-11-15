@@ -28,6 +28,8 @@ Run `mise run check` and `mise run test:containers` before you open a pull reque
 action.yml               build-repo, the root action (the only one the Marketplace lists)
 sign-rpm/ check-rpm/     composite actions; each action.yml only maps inputs to env and
 fetch-history/             calls lib/action.sh
+build-keyring/ build-site/
+seal-site/ check-site/
 install-test/
 package-rust/
 .github/workflows/
@@ -62,8 +64,9 @@ These keep the actions safe for every caller. CI enforces most of them.
   without `..`, URLs `https://` or `file:///`, names `[a-z0-9][a-z0-9.+-]*`).
 - **The signing key** lives only in a fresh `GNUPGHOME` that goes away with the step (a tmpfs in
   docker mode). It reaches a container by variable name, never as an argument or a file in the
-  workspace, and it is never printed. No job that holds it builds anything or holds the Pages
-  token.
+  workspace, and it is never printed. Only the import reads it: the scripts take it out of the
+  environment first, so no package manager, package reader or other tool sees it. No job that holds
+  it builds anything or holds the Pages token.
 - **Fail closed.** No pin and no key is the only unsigned case. Every other mismatch is an error
   ([docs/signing.md](docs/signing.md#fail-closed-matrix)).
 - **Pins.** Every `uses:` is pinned to a full commit SHA with a `# vX.Y.Z` comment, every image by

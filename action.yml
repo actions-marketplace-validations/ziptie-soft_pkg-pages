@@ -1,7 +1,8 @@
 # build-repo: the root action, and the one GitHub Marketplace lists. Builds the APT and DNF
 # repositories site from a directory of .deb/.rpm files, signed when a pin and a key are given,
 # and uploads it as a Pages artifact. Contract: docs/actions.md#build-repo. The work is done by
-# lib/action.sh → lib/pages-repo.sh.
+# lib/action.sh, which runs the stages of the build (build-keyring, sign-rpm, build-site,
+# seal-site, check-site) in separate containers, so the key never meets the package parsing.
 name: pkg-pages
 description: Build signed APT and DNF/RPM repositories, with an optional hash-pinned Nix flake
 author: ziptie-soft
@@ -12,13 +13,30 @@ branding:
 inputs:
   packages:
     description: >-
-      Directory holding every .deb and .rpm the site publishes: this release's and the earlier
-      ones (see fetch-history). Name, version and architecture are read from each package's
-      metadata, not from its file name.
+      Directory holding this release's .deb and .rpm files only (the earlier releases' go in
+      history). Name, version and architecture are read from each package's metadata, not from
+      its file name.
     required: true
   version:
     description: The version this release publishes; the site fails to build unless it is among the packages.
     required: true
+  tag:
+    description: >-
+      This release's tag (letters, digits and . _ + / -). The site lists its packages in a
+      manifest, pkg-pages.tsv (signed when the site is), each under its release tag.
+    required: true
+  history:
+    description: >-
+      Directory of earlier releases' packages: fetch-history's dir. Needs history-map. Empty: no
+      earlier releases. The directory is never modified.
+    required: false
+    default: ''
+  history-map:
+    description: >-
+      The map fetch-history wrote for history (its map output): each earlier file by tag,
+      SHA-256, path and source. Needs history. Never modified.
+    required: false
+    default: ''
   name:
     description: >-
       Base name of the published files (<name>.asc, deb/<name>.list, rpm/<name>.repo) and of the
@@ -26,7 +44,7 @@ inputs:
     required: false
     default: ''
   title:
-    description: Landing page title and APT Description. Defaults to "<name> package repositories".
+    description: Landing page title, .repo name and APT Description, on one line. Defaults to "<name> package repositories".
     required: false
     default: ''
   description:
@@ -40,7 +58,8 @@ inputs:
   base-url:
     description: >-
       Where the site is served (https:// or file:///). Defaults to
-      https://<owner, lowercased>.github.io/<repo>.
+      https://<owner, lowercased>.github.io/<repo>. Letters, digits and . _ ~ : / % + @ = , - only:
+      the install commands use it unquoted.
     required: false
     default: ''
   suite:
@@ -88,6 +107,23 @@ inputs:
     description: Armored secret signing subkey without a passphrase. Pass a secret; never log it.
     required: false
     default: ''
+  resign-history:
+    description: >-
+      An earlier release's .rpm from a GitHub release (fetch-history from releases) that doesn't
+      verify against public-key is unproven: sign it again with a warning (true), or fail on it
+      (false). Files proven by the live site's manifest need no permission, and are signed again
+      with the current subkey whenever it didn't sign them. This release's packages are always
+      signed. A one-run bootstrap tool (a site that predates signing, or a lost one), never a
+      default: check where the files came from first.
+    required: false
+    default: 'false'
+  keyring-package:
+    description: >-
+      Publish a <name>-keyring .deb that carries the public key, which the .list then uses as the
+      APT key and the landing page installs first (signed sites with .deb files only; else a
+      notice). A .deb only: rpm can't import a key from a package scriptlet. false opts out.
+    required: false
+    default: 'true'
   directory-listings:
     description: Write an index.html into every directory (Pages serves no listings of its own).
     required: false
@@ -96,6 +132,12 @@ inputs:
     description: Add a small footer linking to pkg-pages to the landing page and directory listings.
     required: false
     default: 'true'
+  footer-version:
+    description: >-
+      The pkg-pages version the footer names; empty: this action's version.txt. publish.yml sets
+      it, as it runs the actions of the commit before the release commit.
+    required: false
+    default: ''
   packslip-project:
     description: >-
       packslip project the landing page shows install commands for, e.g. github.com/OWNER/REPO;
@@ -157,6 +199,10 @@ runs:
       env:
         INPUT_PACKAGES: ${{ inputs.packages }}
         INPUT_VERSION: ${{ inputs.version }}
+        INPUT_TAG: ${{ inputs.tag }}
+        INPUT_HISTORY: ${{ inputs.history }}
+        INPUT_HISTORY_MAP: ${{ inputs.history-map }}
+        INPUT_KEYRING_PACKAGE: ${{ inputs.keyring-package }}
         INPUT_NAME: ${{ inputs.name }}
         INPUT_TITLE: ${{ inputs.title }}
         INPUT_DESCRIPTION: ${{ inputs.description }}
@@ -170,8 +216,10 @@ runs:
         INPUT_NIX_BINARIES: ${{ inputs.nix-binaries }}
         INPUT_NIX_URL_BASE: ${{ inputs.nix-url-base }}
         INPUT_PUBLIC_KEY: ${{ inputs.public-key }}
+        INPUT_RESIGN_HISTORY: ${{ inputs.resign-history }}
         INPUT_DIRECTORY_LISTINGS: ${{ inputs.directory-listings }}
         INPUT_FOOTER: ${{ inputs.footer }}
+        INPUT_FOOTER_VERSION: ${{ inputs.footer-version }}
         INPUT_PACKSLIP_PROJECT: ${{ inputs.packslip-project }}
         INPUT_PACKSLIP_PIN: ${{ inputs.packslip-pin }}
         INPUT_EXTRA_SITE: ${{ inputs.extra-site }}

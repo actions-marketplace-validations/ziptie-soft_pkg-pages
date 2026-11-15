@@ -135,7 +135,8 @@ selfpin_repo() {
     echo 'runs: { using: composite, steps: [] }' > sign-rpm/action.yml
     echo 'echo hi' > lib/x.sh
     echo 'X=1' > images.env
-    printf 'jobs:\n  a:\n    steps:\n      - uses: ziptie-soft/pkg-pages/sign-rpm@%s # v0.0.0 pkg-pages self-pin\n      - uses: ziptie-soft/pkg-pages@%s # v0.0.0 pkg-pages self-pin\n' \
+    echo 1.0.0 > version.txt
+    printf 'jobs:\n  a:\n    steps:\n      - uses: ziptie-soft/pkg-pages/sign-rpm@%s # v0.0.0 pkg-pages self-pin\n      - uses: ziptie-soft/pkg-pages@%s # v0.0.0 pkg-pages self-pin\n        with:\n          footer-version: 0.0.0 # pkg-pages self-pin\n' \
         "$(printf '%040d' 0)" "$(printf '%040d' 0)" > .github/workflows/publish.yml
     git add -A
     git commit -qm 'feat: w'
@@ -147,6 +148,7 @@ selfpin_repo() {
     run dev/self-pin.sh "$W" 1.2.3
     assert_status 0
     [ "$(grep -c "@$W # v1.2.3 pkg-pages self-pin\$" .github/workflows/publish.yml)" -eq 2 ]
+    grep -qx '          footer-version: 1.2.3 # pkg-pages self-pin' .github/workflows/publish.yml
 }
 
 @test "self-pin: refuses a short SHA, a bad version and an unmarked self reference" {
@@ -184,6 +186,27 @@ selfpin_repo() {
     done
 }
 
+@test "self-pin --check: fails unless the pins, footer-version and version.txt name one version" {
+    # The release commit bumps version.txt; W's actions still hold the previous one.
+    selfpin_repo
+    dev/self-pin.sh "$W" 1.0.0 > /dev/null
+    echo 1.0.1 > version.txt
+    git add -A
+    git commit -qm 'chore(release): 1.0.1'
+    run dev/self-pin.sh --check
+    assert_status 1
+    assert_output_contains "several versions"
+    dev/self-pin.sh "$W" 1.0.1 > /dev/null
+    git commit -qam 'chore(release): pin'
+    run dev/self-pin.sh --check
+    assert_status 0
+    sed -i '/footer-version/d' .github/workflows/publish.yml
+    git commit -qam 'chore: no footer-version'
+    run dev/self-pin.sh --check
+    assert_status 1
+    assert_output_contains "no 'footer-version"
+}
+
 @test "self-pin --check: fails on a new action added after W" {
     selfpin_repo
     dev/self-pin.sh "$W" 1.0.0 > /dev/null
@@ -193,6 +216,17 @@ selfpin_repo() {
     git commit -qm 'feat: new'
     run dev/self-pin.sh --check
     assert_status 1
+}
+
+@test "self-pin --check: fails when a referenced action is missing at W" {
+    selfpin_repo
+    dev/self-pin.sh "$W" 1.0.0 > /dev/null
+    printf '      - uses: ziptie-soft/pkg-pages/nope@%s # v1.0.0 pkg-pages self-pin\n' "$W" >> .github/workflows/publish.yml
+    git add .github/workflows/publish.yml
+    git commit -qm 'test: reference missing self action'
+    run dev/self-pin.sh --check
+    assert_status 1
+    assert_output_contains "the pinned commit $W has no nope/action.yml"
 }
 
 @test "self-pin --check: fails on stale, mixed or unknown pins" {
@@ -210,7 +244,7 @@ selfpin_repo() {
     assert_output_contains "several commits"
 }
 
-@test "self-pin -C: the script from one checkout works on another (release.yml's trusted copy)" {
+@test "self-pin -C: the script from one checkout works on another" {
     selfpin_repo
     rm dev/self-pin.sh
     git commit -qam 'chore: no script on this branch'

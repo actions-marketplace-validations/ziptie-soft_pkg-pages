@@ -7,14 +7,27 @@
 # subkeys and their revocations. CI gets one secret signing subkey of it. Signing fails closed:
 # once a pin exists, every run must be signed by a subkey it lists.
 #
-# All gpg calls use GNUPGHOME, which the caller points at a fresh, private directory that is
-# removed after the step (lib/run.sh does that).
+# The calls that hold or use the secret key use GNUPGHOME, which the caller points at a fresh,
+# private directory that is removed after the step (lib/run.sh does that). The calls that only read
+# a public key go through pin_gpg, which doesn't need GNUPGHOME or a writable home directory: the
+# read-only container has neither.
+
+# pin_gpg ARG...: run gpg with ARG... in a private, empty home of its own, removed on return, so it
+# neither reads nor writes GNUPGHOME or ~/.gnupg. Not make_tmpdir: callers run it in $(...), where a
+# cleanup registered by make_tmpdir would be lost.
+pin_gpg() {
+    _pgh="$(mktemp -d "${TMPDIR:-/tmp}/pkg-pages.XXXXXX")" || die "mktemp failed"
+    _pgrc=0
+    gpg --homedir "$_pgh" "$@" || _pgrc=$?
+    rm -rf "$_pgh"
+    return "$_pgrc"
+}
 
 # pin_fpr PIN: print the primary key fingerprint of PIN. Fails unless PIN holds exactly one public
 # key and no secret key material.
 pin_fpr() {
     [ -f "$1" ] || die "public-key $1 does not exist"
-    _colons="$(gpg --batch --with-colons --show-keys "$1" 2> /dev/null)" ||
+    _colons="$(pin_gpg --batch --with-colons --show-keys "$1" 2> /dev/null)" ||
         die "public-key $1 is not an OpenPGP certificate"
     if printf '%s\n' "$_colons" | grep -q '^sec:'; then
         die "public-key $1 holds secret key material; commit only the public key"
@@ -26,8 +39,29 @@ pin_fpr() {
 
 # pin_subkeys PIN: print the fingerprints of every subkey PIN lists, one per line.
 pin_subkeys() {
-    gpg --batch --with-colons --show-keys "$1" |
+    pin_gpg --batch --with-colons --show-keys "$1" |
         awk -F: '$1 == "sub" { s = 1; next } $1 == "fpr" && s { print $10; s = 0 }'
+}
+
+# pin_rpm_key PIN OUT: write to OUT the key dnf imports: PIN's primary key with its self-signatures
+# and every subkey that is neither revoked nor expired, armored. rpm 4.16 (RHEL 9) can't import a
+# certificate that carries a revoked subkey, and would fail a fresh install with the whole pin.
+# The same pin gives the same bytes. Fails unless a usable signing subkey is left. Runs in a
+# private GNUPGHOME of its own.
+pin_rpm_key() {
+    require_tools gpg
+    _kfpr="$(pin_fpr "$1")"
+    _khome=''
+    make_tmpdir _khome
+    chmod 700 "$_khome"
+    gpg --homedir "$_khome" --batch --quiet --import "$1" 2> /dev/null ||
+        die "could not import public-key $1 to make the dnf key"
+    gpg --homedir "$_khome" --batch --armor --export-options export-minimal,export-clean \
+        --export-filter 'drop-subkey=revoked -t || expired -t' --export "$_kfpr" > "$2" 2> /dev/null ||
+        die "could not make the dnf key from public-key $1"
+    _kok="$(pin_gpg --batch --with-colons --show-keys "$2" 2> /dev/null |
+        awk -F: '$1 == "sub" && index($12, "s") && $2 !~ /[re]/ { n++ } END { print n + 0 }')"
+    [ "$_kok" -ge 1 ] || die "public-key $1 has no signing subkey that is neither revoked nor expired"
 }
 
 # secret_fpr: print the primary fingerprint of the only secret key in GNUPGHOME, or nothing when
@@ -99,8 +133,57 @@ signing_import() {
             --local-user "$_sub!" --sign > /dev/null 2>&1 ||
             die "signing subkey $_sub can't sign: passphrase-protected, expired, revoked or not a signing key"
     done
+    # Warn while there is time to rotate: field 7 of an ssb record is the expiry (empty: never).
+    _soon="$(gpg --batch --with-colons --with-subkey-fingerprints --list-secret-keys |
+        awk -F: -v now="$(date +%s)" '$1 == "ssb" { e = $7; next } $1 == "fpr" && e != "" { if (e - now < 90 * 86400) print $10 " " e; e = "" } $1 == "fpr" { e = "" }')"
+    printf '%s\n' "$_soon" | while read -r _s _e; do
+        [ -z "$_s" ] || warning "signing subkey $_s expires in $(((_e - $(date +%s)) / 86400)) day(s): rotate before then (docs/signing.md)"
+    done
     log "imported signing subkey $(printf '%s' "$_subs" | tr '\n' ' ') of $_fpr"
     printf '%s\n' "$_fpr"
+}
+
+# gpg_verify [--allow-expired] PIN SIG [DATA]: accept SIG (a clearsigned file when DATA is absent,
+# else a detached signature of DATA) only if it is valid, made by a key of PIN, and not by a
+# revoked or expired key. gpgv exits 0 for a revoked or expired key, so this reads its status
+# lines, whole tokens only:
+#   - gpgv exits 0, and there is exactly one VALIDSIG whose primary fingerprint ($12) is PIN's;
+#   - a GOODSIG (or EXPKEYSIG, see below) is present, and none of REVKEYSIG, EXPSIG, BADSIG, ERRSIG, NO_PUBKEY;
+#   - EXPKEYSIG (an expired key) fails, unless --allow-expired: then it passes with a warning.
+gpg_verify() {
+    _allow_expired=false
+    if [ "${1:-}" = --allow-expired ]; then
+        _allow_expired=true
+        shift
+    fi
+    [ "$#" -ge 2 ] || die "gpg_verify needs a public key and a signature"
+    _vpin="$1"
+    shift
+    require_tools gpg gpgv
+    _vfpr="$(pin_fpr "$_vpin")"
+    _vdir=''
+    make_tmpdir _vdir
+    pin_gpg --batch --dearmor < "$_vpin" > "$_vdir/pin.gpg" 2> /dev/null || die "public-key $_vpin can't be read"
+    _vrc=0
+    _vstatus="$(gpgv --status-fd 1 --keyring "$_vdir/pin.gpg" "$@" 2> /dev/null)" || _vrc=$?
+    rm -rf "$_vdir"
+    [ "$_vrc" -eq 0 ] || die "$* does not verify against $_vpin (gpgv exit $_vrc)"
+    _vbad="$(printf '%s\n' "$_vstatus" |
+        awk '$1 == "[GNUPG:]" && ($2 == "REVKEYSIG" || $2 == "EXPSIG" || $2 == "BADSIG" || $2 == "ERRSIG" || $2 == "NO_PUBKEY") { print $2; exit }')"
+    [ -z "$_vbad" ] || die "$* does not verify against $_vpin ($_vbad)"
+    # gpgv reports an expired subkey as EXPKEYSIG instead of GOODSIG, so that counts as good here;
+    # it is refused below unless --allow-expired.
+    printf '%s\n' "$_vstatus" | awk '$1 == "[GNUPG:]" && ($2 == "GOODSIG" || $2 == "EXPKEYSIG") { f = 1 } END { exit !f }' ||
+        die "$* does not verify against $_vpin (no good signature)"
+    _vn="$(printf '%s\n' "$_vstatus" | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { n++ } END { print n + 0 }')"
+    [ "$_vn" -eq 1 ] || die "$* does not verify against $_vpin ($_vn signatures, expected 1)"
+    _vsub="$(printf '%s\n' "$_vstatus" | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $3 }')"
+    [ "$(printf '%s\n' "$_vstatus" | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $12 }')" = "$_vfpr" ] ||
+        die "$* is signed by a key that is not the primary $_vfpr of $_vpin"
+    if printf '%s\n' "$_vstatus" | awk '$1 == "[GNUPG:]" && $2 == "EXPKEYSIG" { f = 1 } END { exit !f }'; then
+        [ "$_allow_expired" = true ] || die "$* is signed by the expired subkey $_vsub of $_vpin"
+        warning "$* is signed by the expired subkey $_vsub of $_vpin"
+    fi
 }
 
 # rpm_verifies PIN FILE DB: true when FILE carries a valid signature by PIN. DB is an rpm database
@@ -110,16 +193,22 @@ rpm_verifies() {
     rpmkeys --dbpath "$3" --define '_pkgverify_level signature' --checksig "$2" > /dev/null 2>&1
 }
 
-# rpm_db_with_pin PIN VAR: create a temporary rpm database holding only PIN, path in VAR.
+# rpm_db_with_pin PIN VAR: create a temporary rpm database holding only the dnf key of PIN
+# (pin_rpm_key: no revoked or expired subkeys), path in VAR. That is the key dnf clients get
+# through gpgkey=, and rpm before 4.20 can't import a pin that carries a revoked subkey. A file
+# signed by a revoked subkey therefore fails, on every rpm version.
 rpm_db_with_pin() {
     make_tmpdir "$2"
     _rdb=''
     eval "_rdb=\$$2"
-    rpmkeys --dbpath "$_rdb" --import "$1" || die "rpmkeys could not import public-key $1"
+    _rkdir=''
+    make_tmpdir _rkdir
+    pin_rpm_key "$1" "$_rkdir/key.asc"
+    rpmkeys --dbpath "$_rdb" --import "$_rkdir/key.asc" || die "rpmkeys could not import public-key $1"
 }
 
-# check_rpm PIN FILE...: fail unless every FILE has a valid signature by PIN, as dnf checks with
-# gpgcheck=1. Needs only rpmkeys, no secret.
+# check_rpm PIN FILE...: fail unless every FILE has a valid signature by a subkey of PIN that is
+# neither revoked nor expired, as dnf checks with gpgcheck=1 (it imports pin_rpm_key's output). Needs only rpmkeys, no secret.
 check_rpm() {
     _pin="$1"
     shift

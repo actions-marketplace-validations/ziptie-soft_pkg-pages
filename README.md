@@ -25,10 +25,10 @@ sudo dnf install <name>
 
 ```sh
 # APT (Debian, Ubuntu)
-sudo install -d -m 0755 /etc/apt/keyrings
-sudo curl -fsSLo /etc/apt/keyrings/<name>.asc https://<owner>.github.io/<repo>/<name>.asc
-echo 'deb [signed-by=/etc/apt/keyrings/<name>.asc] https://<owner>.github.io/<repo>/deb stable main' | sudo tee /etc/apt/sources.list.d/<name>.list
-sudo apt update && sudo apt install <name>
+sudo curl -fsSLo /usr/share/keyrings/<name>-keyring.asc https://<owner>.github.io/<repo>/<name>.asc
+sudo curl -fsSLo /etc/apt/sources.list.d/<name>.list https://<owner>.github.io/<repo>/deb/<name>.list
+sudo apt update
+sudo apt install <name>-keyring <name>
 ```
 
 When the release workflow enables Nix support:
@@ -49,8 +49,10 @@ commands, so users who know one know them all ([docs/design.md](docs/design.md#p
 - **Signing is optional and fails closed.** With no committed public key and no secret, the
   repositories are published unsigned. Once the key is committed, every release must be signed
   with it, or the release fails ([docs/signing.md](docs/signing.md)).
-- **An offline primary key, with only a signing subkey in CI.** Subkeys can be rotated or
-  revoked without users re-trusting anything.
+- **An offline primary key, with only a signing subkey in CI.** A standby subkey is published
+  from the start, so rotation and revocation need no new trust. APT users get them through the
+  `<name>-keyring` package; DNF steps depend on the version
+  ([docs/signing.md](docs/signing.md#rotating-or-revoking-the-subkey)).
 - **Earlier versions stay installable.** The last N releases' packages are fetched from GitHub
   Releases and republished, so `dnf downgrade` and `apt install pkg=1.2.3` keep working.
 - **Install tests** on clean Fedora, Debian and Ubuntu containers before anything goes public.
@@ -68,6 +70,10 @@ runs cargo-deb and cargo-generate-rpm for you ([docs/building.md](docs/building.
 | Path | Kind | Does |
 |---|---|---|
 | [`action.yml`](action.yml) (`ziptie-soft/pkg-pages@…`) | composite | **build-repo**: build (and sign) the APT/DNF site from a directory of packages |
+| [`build-keyring/`](build-keyring/action.yml) | composite | Build the `<name>-keyring` `.deb` that carries the public key |
+| [`build-site/`](build-site/action.yml) | composite | Build the site without a key, so the job that parses packages never holds one |
+| [`seal-site/`](seal-site/action.yml) | composite | Sign the site's metadata with the CI subkey: the only step that holds the key |
+| [`check-site/`](check-site/action.yml) | composite | Check the built site as a client sees it, and upload it as the Pages artifact |
 | [`sign-rpm/`](sign-rpm/action.yml) | composite | Sign `.rpm` files with the CI subkey, checked against the pin |
 | [`check-rpm/`](check-rpm/action.yml) | composite | Verify `.rpm` signatures against the pin, as dnf does |
 | [`fetch-history/`](fetch-history/action.yml) | composite | Download earlier releases' packages from GitHub Releases |
